@@ -50,7 +50,7 @@ brew install make       # if you need GNU make
 If you are on macOS and want to statically link against Homebrew’s ZSTD (`/opt/homebrew/lib/libzstd.a`), you might edit the `Makefile` (see the comments in the file) or compile manually:
 
 ```bash
-clang -O3 -o zindex main cJSON.c \
+clang -O3 -o zindex main.c cJSON.c \
     -I/opt/homebrew/include /opt/homebrew/lib/libzstd.a -lpthread
 ```
 
