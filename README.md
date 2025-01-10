@@ -1,7 +1,5 @@
 # zindex
 
----
-
 **zindex** is a small C program that can search within `.tar.zst` archives using an accompanying `.idx.json` index file. It uses a Boyer–Moore search on each decompressed chunk. The archives must be named as `batch_XXXXX.tar.zst` with corresponding `batch_XXXXX.tar.idx.json` index files in the same directory. 
 
 This project arose from a prototype that originally used Aho–Corasick but was adapted to Boyer–Moore for simplicity and processing speed.
