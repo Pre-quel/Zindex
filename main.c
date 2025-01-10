@@ -15,20 +15,19 @@
 
 #include "cJSON.h" // The cJSON library header
 
-// For limiting chunk memory usage, etc.
+// -----------------------------------------------------------------------------
+//  Const
+// -----------------------------------------------------------------------------
 #define MAX_CHUNK_UNCOMPRESSED (64ULL * 1024ULL * 1024ULL) // e.g. 64MB max
-#define ROLLING_BUF_SIZE (64 * 1024)                       // Use a bigger ring buffer if you want
+#define ROLLING_BUF_SIZE (64 * 1024)     // keep dat RAM low           
 #define MAX_FILENAME_LEN 512
 #define MAX_PREVIEW_LEN 1024
 #define MAX_QUEUE_SIZE 20000
-
-#define MAX_THREADS 8 // or 12, however many you want
+#define MAX_THREADS 8 // or set to whatever makes sense
 
 // -----------------------------------------------------------------------------
-//  Data structures from your existing code
+//  Data structures
 // -----------------------------------------------------------------------------
-
-// chunk-based index structures
 typedef struct
 {
     int chunk_id;
@@ -44,7 +43,6 @@ typedef struct
     size_t count;
 } IndexInfo;
 
-// For your ring buffer approach
 typedef struct
 {
     char filename[MAX_FILENAME_LEN];
@@ -53,7 +51,7 @@ typedef struct
     char preview[2048];
 } SearchResult;
 
-// PrintQueue for multi-threaded result printing
+// A simple thread-safe queue for results
 typedef struct PrintNode
 {
     SearchResult item;
@@ -70,6 +68,49 @@ typedef struct
     pthread_cond_t cond;
 } PrintQueue;
 
+// -----------------------------------------------------------------------------
+//  Base64 decode helper
+// -----------------------------------------------------------------------------
+static int b64Value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+uint8_t* base64_decode(const char* b64, size_t* outLen)
+{
+    size_t len = strlen(b64);
+    int pad = 0;
+    if (len >= 2 && b64[len-1]=='=') { pad++; }
+    if (len >= 2 && b64[len-2]=='=') { pad++; }
+
+    size_t out_size = (len * 3) / 4 - pad;
+    uint8_t* out = malloc(out_size);
+    if(!out) return NULL;
+
+    size_t j=0;
+    unsigned val=0;
+    int valb=-8;
+    for(size_t i=0; i<len; i++){
+        int c = b64Value((unsigned char)b64[i]);
+        if(c<0 && b64[i] != '=') continue; // skip whitespace or invalid
+        if(b64[i] == '=') c=0;  // pad
+        val=(val<<6)+c;
+        valb += 6;
+        if(valb>=0){
+            out[j++]=(uint8_t)((val>>valb)&0xFF);
+            valb-=8;
+        }
+    }
+    if(outLen) *outLen=j;
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+//  Print Queue stuff
+// -----------------------------------------------------------------------------
 static void printqueue_init(PrintQueue *q)
 {
     q->head = q->tail = NULL;
@@ -78,6 +119,7 @@ static void printqueue_init(PrintQueue *q)
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->cond, NULL);
 }
+
 static void printqueue_destroy(PrintQueue *q)
 {
     PrintNode *cur = q->head;
@@ -90,6 +132,7 @@ static void printqueue_destroy(PrintQueue *q)
     pthread_mutex_destroy(&q->lock);
     pthread_cond_destroy(&q->cond);
 }
+
 static void printqueue_push(PrintQueue *q, const SearchResult *res)
 {
     pthread_mutex_lock(&q->lock);
@@ -120,6 +163,7 @@ static void printqueue_push(PrintQueue *q, const SearchResult *res)
     pthread_cond_signal(&q->cond);
     pthread_mutex_unlock(&q->lock);
 }
+
 static bool printqueue_pop(PrintQueue *q, SearchResult *out)
 {
     pthread_mutex_lock(&q->lock);
@@ -142,6 +186,7 @@ static bool printqueue_pop(PrintQueue *q, SearchResult *out)
     pthread_mutex_unlock(&q->lock);
     return true;
 }
+
 static void printqueue_mark_done(PrintQueue *q)
 {
     pthread_mutex_lock(&q->lock);
@@ -151,58 +196,7 @@ static void printqueue_mark_done(PrintQueue *q)
 }
 
 // -----------------------------------------------------------------------------
-//  Aho-Corasick structures
-// -----------------------------------------------------------------------------
-#define AC_ALPHABET_SIZE 256
-
-typedef struct ACNode
-{
-    struct ACNode *children[AC_ALPHABET_SIZE];
-    struct ACNode *fail;
-    int output;
-    int depth;
-} ACNode;
-
-typedef struct
-{
-    ACNode **nodes;
-    size_t count;
-    size_t capacity;
-    pthread_mutex_t lock;
-} NodeTracker;
-
-static NodeTracker g_tracker;
-static pthread_mutex_t g_pattern_mutex = PTHREAD_MUTEX_INITIALIZER;
-static size_t g_patternLen = 0;
-
-static void set_pattern_len(size_t len)
-{
-    pthread_mutex_lock(&g_pattern_mutex);
-    g_patternLen = len;
-    pthread_mutex_unlock(&g_pattern_mutex);
-}
-static size_t get_pattern_len(void)
-{
-    pthread_mutex_lock(&g_pattern_mutex);
-    size_t len = g_patternLen;
-    pthread_mutex_unlock(&g_pattern_mutex);
-    return len;
-}
-
-// ring buffer state
-typedef struct
-{
-    char buffer[ROLLING_BUF_SIZE];
-    size_t writePos;
-    off_t globalOffset;
-    ACNode *acState;
-    pthread_mutex_t lock;
-} RingBufState;
-
-static __thread RingBufState g_ring;
-
-// -----------------------------------------------------------------------------
-//  JSON Parsing for .idx.json
+//  JSON Parsing for .idx.json (unchanged except for bloom stuff removed)
 // -----------------------------------------------------------------------------
 static IndexInfo *parse_index_json(const char *idx_filename)
 {
@@ -265,6 +259,7 @@ static IndexInfo *parse_index_json(const char *idx_filename)
     free(buf);
     return info;
 }
+
 static void free_index_info(IndexInfo *info)
 {
     if (!info)
@@ -274,246 +269,170 @@ static void free_index_info(IndexInfo *info)
 }
 
 // -----------------------------------------------------------------------------
-//  Aho–Corasick creation
+//  Boyer–Moore (or Horspool) -style search function (case-insensitive).
+//  // *** BM CHANGE ***
 // -----------------------------------------------------------------------------
-static void init_node_tracker(void)
+static void build_badchar_table(const char *pattern, size_t patLen, int badCharTable[256])
 {
-    g_tracker.nodes = malloc(1024 * sizeof(ACNode *));
-    g_tracker.capacity = 1024;
-    g_tracker.count = 0;
-    pthread_mutex_init(&g_tracker.lock, NULL);
-}
-static ACNode *create_node(void)
-{
-    ACNode *node = calloc(1, sizeof(*node));
-    if (!node)
-        return NULL;
+    // Initialize all occurrences as -1
+    for (int i = 0; i < 256; i++)
+        badCharTable[i] = (int)patLen;
 
-    pthread_mutex_lock(&g_tracker.lock);
-    if (g_tracker.count >= g_tracker.capacity)
-    {
-        size_t newcap = g_tracker.capacity * 2;
-        ACNode **newarr = realloc(g_tracker.nodes, newcap * sizeof(ACNode *));
-        if (!newarr)
-        {
-            pthread_mutex_unlock(&g_tracker.lock);
-            free(node);
-            return NULL;
-        }
-        g_tracker.nodes = newarr;
-        g_tracker.capacity = newcap;
-    }
-    g_tracker.nodes[g_tracker.count++] = node;
-    pthread_mutex_unlock(&g_tracker.lock);
-    return node;
-}
-static void free_aho_automaton(ACNode *root)
-{
-    pthread_mutex_lock(&g_tracker.lock);
-    for (size_t i = 0; i < g_tracker.count; i++)
-    {
-        free(g_tracker.nodes[i]);
-    }
-    free(g_tracker.nodes);
-    g_tracker.nodes = NULL;
-    g_tracker.count = g_tracker.capacity = 0;
-    pthread_mutex_unlock(&g_tracker.lock);
-    pthread_mutex_destroy(&g_tracker.lock);
-}
-ACNode *build_aho_automaton(const char *pattern)
-{
-    set_pattern_len(strlen(pattern));
-    ACNode *root = create_node();
-    if (!root)
-        return NULL;
-
-    // Insert the pattern characters exactly once
-    ACNode *cur = root;
-    for (size_t i = 0; i < get_pattern_len(); i++)
+    // Fill the actual last occurrence of each character
+    for (size_t i = 0; i < patLen - 1; i++)
     {
         unsigned char c = (unsigned char)tolower((unsigned char)pattern[i]);
-        if (!cur->children[c])
-        {
-            cur->children[c] = create_node();
-            if (!cur->children[c])
-                return root;
-            cur->children[c]->depth = cur->depth + 1;
-        }
-        cur = cur->children[c];
+        badCharTable[c] = (int)(patLen - 1 - i);
     }
-    cur->output = 1;
-    // BFS for fail links
-    // Typically we do the classic approach:
-    ACNode **queue = malloc(MAX_QUEUE_SIZE * sizeof(ACNode *)); // or bigger
-    if (!queue)
-        return root;
-
-    int front = 0, back = 0;
-
-    // For c in [0..255], if child is null => set child to root
-    // otherwise set fail= root & enqueue
-    for (int c = 0; c < AC_ALPHABET_SIZE; c++)
-    {
-        if (root->children[c])
-        {
-            root->children[c]->fail = root;
-            queue[back++] = root->children[c];
-        }
-        else
-        {
-            // direct transition from root
-            root->children[c] = root;
-        }
-    }
-
-    // BFS
-    while (front < back)
-    {
-        ACNode *u = queue[front++];
-        for (int c = 0; c < AC_ALPHABET_SIZE; c++)
-        {
-            ACNode *v = u->children[c];
-            if (!v)
-            {
-                // set missing transition to fail->children[c]
-                u->children[c] = u->fail->children[c];
-            }
-            else
-            {
-                // set fail
-                ACNode *f = u->fail;
-                v->fail = f->children[c];
-                v->output |= v->fail->output;
-                queue[back++] = v;
-            }
-        }
-    }
-    free(queue);
-    return root;
 }
 
-// simple closeness measure
-static int compute_closeness(const char *haystack, const char *needle)
+// Returns all matches of `pattern` in `text`, ignoring case. For each match
+// found, calls "reporting" routine that will build a preview and push to queue.
+static void boyer_moore_search(
+    const char *text, size_t textLen,
+    const char *pattern, size_t patLen,
+    off_t baseOffset,
+    const char *filename,
+    PrintQueue *pqueue)
 {
-    // e.g. count consecutive matching letters from the start
-    int best = 0, curr = 0;
-    while (*haystack && *needle)
+    if (patLen == 0 || textLen < patLen) return;
+
+    // Build skip table
+    int badCharTable[256];
+    build_badchar_table(pattern, patLen, badCharTable);
+
+    // Store a lowercased pattern
+    char *patLower = (char *)malloc(patLen + 1);
+    for (size_t i = 0; i < patLen; i++)
+        patLower[i] = (char)tolower((unsigned char)pattern[i]);
+    patLower[patLen] = '\0';
+
+    size_t i = 0;  // index into text
+    while (i <= textLen - patLen)
     {
-        if (tolower(*haystack) == tolower(*needle))
+        // Compare from the end of the pattern
+        size_t j = patLen - 1;
+        while (j < patLen) // j is unsigned, so j < patLen also checks j != -1
         {
-            curr++;
-            if (curr > best)
-                best = curr;
+            unsigned char t = (unsigned char)tolower((unsigned char)text[i + j]);
+            if (t != (unsigned char)patLower[j])
+                break;
+            if (j == 0)
+            {
+                // Found a match at i
+                {
+                    off_t matchOffset = baseOffset + i;
+                    // We'll extract a line preview
+                    size_t lineStart = i;
+                    while (lineStart > 0 && text[lineStart - 1] != '\n')
+                    {
+                        lineStart--;
+                    }
+                    size_t lineEnd = i + patLen - 1;
+                    while (lineEnd < textLen && text[lineEnd] != '\n')
+                    {
+                        lineEnd++;
+                    }
+                    size_t lineLen = lineEnd - lineStart;
+                    if (lineLen > 1023) lineLen = 1023;
+
+                    char preview[1024];
+                    memset(preview, 0, sizeof(preview));
+                    memcpy(preview, text + lineStart, lineLen);
+                    preview[lineLen] = '\0';
+
+                    // Simple closeness measure
+                    // (Orig. implemenetation w/ Aho-Corasick just aligned chars from pattern vs text)
+                    // (...I guess I'll just stick to that lol)
+                    int closeness = 0, curr = 0;
+                    const char *haystackPtr = text + i;
+                    const char *needlePtr   = pattern; // keep the original pattern for closeness
+                    while (*haystackPtr && *needlePtr)
+                    {
+                        if (tolower(*haystackPtr) == tolower(*needlePtr))
+                        {
+                            curr++;
+                            if (curr > closeness)
+                                closeness = curr;
+                        }
+                        else
+                        {
+                            curr = 0;
+                        }
+                        haystackPtr++;
+                        needlePtr++;
+                    }
+
+                    // Prepare the SearchResult
+                    SearchResult sr;
+                    strncpy(sr.filename, filename, sizeof(sr.filename) - 1);
+                    sr.filename[sizeof(sr.filename) - 1] = '\0';
+                    sr.offset = matchOffset;
+                    sr.closenessScore = closeness;
+                    strncpy(sr.preview, preview, sizeof(sr.preview) - 1);
+                    sr.preview[sizeof(sr.preview) - 1] = '\0';
+                    printqueue_push(pqueue, &sr);
+                }
+
+                // Move forward by 1 (or the entire pattern length).
+                // For standard Boyer–Moore, TODO: shift less dumbly lol
+                i++;
+                goto skip_shift; 
+            }
+            j--;
         }
-        else
+
         {
-            curr = 0;
+            // Mismatch at text[i + j]
+            unsigned char mismatchC = (unsigned char)tolower((unsigned char)text[i + (patLen - 1)]);
+            int shift = badCharTable[mismatchC];
+            if (shift < 1) shift = 1;
+            i += shift;
         }
-        haystack++;
-        needle++;
+
+    skip_shift:;
     }
-    return best;
+
+    free(patLower);
 }
 
 // -----------------------------------------------------------------------------
-//  Ring Buffer Logic
+//  Keep a "ring buffer", but do BM search each time
+//  we fill or flush the buffer.  // *** BM CHANGE after removing Aho-Corasick ***
 // -----------------------------------------------------------------------------
-static void ringbuf_init(ACNode *root)
+typedef struct
+{
+    char buffer[ROLLING_BUF_SIZE];
+    size_t writePos;
+    off_t globalOffset;
+    pthread_mutex_t lock;
+} RingBufState;
+
+static __thread RingBufState g_ring;
+
+// Ring buffer -- why even? -- to check across chunk boundaries
+static void ringbuf_init(void)
 {
     pthread_mutex_init(&g_ring.lock, NULL);
     pthread_mutex_lock(&g_ring.lock);
     memset(g_ring.buffer, 0, sizeof(g_ring.buffer));
     g_ring.writePos = 0;
     g_ring.globalOffset = 0;
-    g_ring.acState = root;
     pthread_mutex_unlock(&g_ring.lock);
 }
 
-static void ac_feed_chunk(
-    ACNode **curStatePtr,
-    const char *data,
-    size_t dataLen,
-    ACNode *root,
-    off_t globalOffset,
-    const char *filename,
-    PrintQueue *pqueue,
-    const char *searchStr)
-{
-    if (!curStatePtr || !*curStatePtr || !data || !pqueue || !searchStr)
-    {
-        return;
-    }
-
-    ACNode *st = *curStatePtr;
-    size_t patLen = get_pattern_len();
-
-    for (size_t i = 0; i < dataLen; i++)
-    {
-        unsigned char c = (unsigned char)tolower((unsigned char)data[i]);
-        st = st->children[c];
-        if (st->output)
-        {
-            // We found a 'match' ending at i
-            size_t matchStart = (i >= patLen - 1) ? (i - (patLen - 1)) : 0;
-            off_t matchOffset = globalOffset + matchStart;
-
-            // Let's extract the entire line containing 'i'
-            size_t lineStart = i;
-            while (lineStart > 0 && data[lineStart - 1] != '\n')
-            {
-                lineStart--;
-            }
-
-            size_t lineEnd = i;
-            while (lineEnd < dataLen && data[lineEnd] != '\n')
-            {
-                lineEnd++;
-            }
-
-            // Now [lineStart..lineEnd) is the entire line
-            size_t lineLen = lineEnd - lineStart;
-            if (lineLen > 1023)
-            {
-                // prevent overrun, or pick your own limit
-                lineLen = 1023;
-            }
-
-            char preview[1024];
-            memset(preview, 0, sizeof(preview));
-            memcpy(preview, data + lineStart, lineLen);
-            preview[lineLen] = '\0';
-
-            // Optionally compute closeness again
-            int closeness = compute_closeness(data + matchStart, searchStr);
-
-            // Build the SearchResult
-            SearchResult sr;
-            strncpy(sr.filename, filename, sizeof(sr.filename) - 1);
-            sr.filename[sizeof(sr.filename) - 1] = '\0';
-
-            sr.offset = matchOffset;
-            sr.closenessScore = closeness;
-
-            strncpy(sr.preview, preview, sizeof(sr.preview) - 1);
-            sr.preview[sizeof(sr.preview) - 1] = '\0';
-
-            // Push to queue
-            printqueue_push(pqueue, &sr);
-        }
-    }
-
-    *curStatePtr = st;
-}
-
+// Feed function: once the buffer is full, we do a BM search inside it
 static void ringbuf_feed(
     PrintQueue *pqueue,
     const char *filename,
-    ACNode *root,
-    const char *searchStr,
+    const char *pattern,
+    size_t patLen,
     const char *src, size_t srcLen)
 {
+    pthread_mutex_lock(&g_ring.lock);
     size_t srcPos = 0;
-    size_t overlap = (get_pattern_len() > 0) ? (get_pattern_len() - 1) : 0;
+    // Overlap to handle partial matches across boundaries if desired
+    size_t overlap = (patLen > 0) ? (patLen - 1) : 0;
     if (overlap >= ROLLING_BUF_SIZE)
         overlap = 0;
 
@@ -521,17 +440,20 @@ static void ringbuf_feed(
     {
         if (g_ring.writePos >= ROLLING_BUF_SIZE)
         {
-            // feed entire buffer to AC
-            ac_feed_chunk(&g_ring.acState, g_ring.buffer, g_ring.writePos,
-                          root, (g_ring.globalOffset - g_ring.writePos),
-                          filename, pqueue, searchStr);
+            // Search entire buffer
+            boyer_moore_search(
+                g_ring.buffer, g_ring.writePos,
+                pattern, patLen,
+                g_ring.globalOffset - g_ring.writePos, 
+                filename, pqueue);
 
-            // keep overlap
+            // Keep overlap
             if (overlap > g_ring.writePos)
                 overlap = g_ring.writePos;
             memmove(g_ring.buffer, g_ring.buffer + (g_ring.writePos - overlap), overlap);
             g_ring.writePos = overlap;
         }
+
         size_t space = ROLLING_BUF_SIZE - g_ring.writePos;
         if (space > srcLen)
             space = srcLen;
@@ -542,31 +464,38 @@ static void ringbuf_feed(
         srcLen -= space;
         srcPos += space;
     }
+    pthread_mutex_unlock(&g_ring.lock);
 }
+
+// Once we are done with a chunk/file, flush any leftover in the ring buffer
 static void ringbuf_flush(
     PrintQueue *pqueue,
     const char *filename,
-    ACNode *root,
-    const char *searchStr)
+    const char *pattern,
+    size_t patLen)
 {
+    pthread_mutex_lock(&g_ring.lock);
     if (g_ring.writePos > 0)
     {
-        ac_feed_chunk(&g_ring.acState, g_ring.buffer, g_ring.writePos,
-                      root, (g_ring.globalOffset - g_ring.writePos),
-                      filename, pqueue, searchStr);
+        boyer_moore_search(
+            g_ring.buffer, g_ring.writePos,
+            pattern, patLen,
+            g_ring.globalOffset - g_ring.writePos,
+            filename, pqueue);
     }
     g_ring.writePos = 0;
+    pthread_mutex_unlock(&g_ring.lock);
 }
 
 // -----------------------------------------------------------------------------
-//  Decompress a single chunk from .tar.zst using offsets from .idx.json
+//  Decompress a single chunk and perform searching via ringbuf (BM).
 // -----------------------------------------------------------------------------
 static void decompress_and_search_chunk(
     const char *zstFile,
     const ChunkInfo *c,
     PrintQueue *pqueue,
-    ACNode *root,
-    const char *searchStr)
+    const char *pattern,
+    size_t patLen)
 {
     FILE *fp = fopen(zstFile, "rb");
     if (!fp)
@@ -598,7 +527,6 @@ static void decompress_and_search_chunk(
         return;
     }
 
-    // approximate uncompressed
     long long length = c->uncompressed_end - c->uncompressed_start + 1;
     if (length < 0)
         length = 0;
@@ -613,13 +541,14 @@ static void decompress_and_search_chunk(
         return;
     }
 
-    size_t dSize = ZSTD_decompressDCtx(dctx, dbuf, (size_t)length, cbuf, (size_t)c->compressed_size);
+    size_t dSize = ZSTD_decompressDCtx(
+        dctx, dbuf, (size_t)length, cbuf, (size_t)c->compressed_size);
     if (!ZSTD_isError(dSize))
     {
         // feed ring buffer
-        ringbuf_init(root);
-        ringbuf_feed(pqueue, zstFile, root, searchStr, (const char *)dbuf, dSize);
-        ringbuf_flush(pqueue, zstFile, root, searchStr);
+        ringbuf_init();
+        ringbuf_feed(pqueue, zstFile, pattern, patLen, (const char *)dbuf, dSize);
+        ringbuf_flush(pqueue, zstFile, pattern, patLen);
     }
     else
     {
@@ -633,14 +562,14 @@ static void decompress_and_search_chunk(
 }
 
 // -----------------------------------------------------------------------------
-//  Search a single .tar.zst with .idx.json
+//  Search a single .tar.zst with .idx.json using Boyer–Moore
 // -----------------------------------------------------------------------------
 static void search_indexed_file(
     const char *zstFile,
     const char *idxFile,
     PrintQueue *pqueue,
-    ACNode *root,
-    const char *searchStr)
+    const char *pattern,
+    size_t patLen)
 {
     IndexInfo *info = parse_index_json(idxFile);
     if (!info)
@@ -649,11 +578,10 @@ static void search_indexed_file(
         return;
     }
 
-    // for each chunk
+    // For each chunk
     for (size_t i = 0; i < info->count; i++)
     {
-        decompress_and_search_chunk(zstFile, &info->chunks[i],
-                                    pqueue, root, searchStr);
+        decompress_and_search_chunk(zstFile, &info->chunks[i], pqueue, pattern, patLen);
     }
 
     free_index_info(info);
@@ -669,8 +597,8 @@ typedef struct
     const char **idxFiles;
     int start;
     int end;
-    ACNode *root;
-    const char *searchStr;
+    const char *pattern;
+    size_t patLen;
 } WorkerArg;
 
 static void *worker_thread(void *arg)
@@ -678,36 +606,34 @@ static void *worker_thread(void *arg)
     WorkerArg *W = (WorkerArg *)arg;
     for (int i = W->start; i < W->end; i++)
     {
-        // search each pair
-        search_indexed_file(W->zstFiles[i], W->idxFiles[i],
-                            W->pqueue, W->root, W->searchStr);
+        search_indexed_file(
+            W->zstFiles[i], W->idxFiles[i],
+            W->pqueue,
+            W->pattern,
+            W->patLen);
     }
     return NULL;
 }
 
-// The printer thread
 static void *printer_thread(void *arg)
 {
     PrintQueue *q = (PrintQueue *)arg;
     SearchResult sr;
     while (printqueue_pop(q, &sr))
     {
-        // e.g. you could do a closeness threshold
-        size_t patLen = get_pattern_len();
-        if (sr.closenessScore >= (int)(patLen * 0.6))
-        {
-            printf("{\"file\":\"%s\", \"offset\":%lld, \"score\":%d, \"preview\":\"%s\"}\n",
-                   sr.filename, (long long)sr.offset,
-                   sr.closenessScore,
-                   sr.preview);
-            fflush(stdout);
-        }
+
+        printf("{\"file\":\"%s\", \"offset\":%lld, \"score\":%d, \"preview\":\"%s\"}\n",
+               sr.filename, (long long)sr.offset,
+               sr.closenessScore,
+               sr.preview);
+        fflush(stdout);
+        
     }
     return NULL;
 }
 
 // -----------------------------------------------------------------------------
-//  Main
+//  main()
 // -----------------------------------------------------------------------------
 int main(int argc, char **argv)
 {
@@ -717,11 +643,9 @@ int main(int argc, char **argv)
         return 1;
     }
     const char *pattern = argv[1];
+    size_t patLen = strlen(pattern);
 
-    // A simple approach: we gather pairs: batch_XXXXX.tar.zst & batch_XXXXX.tar.idx.json
-    // or you can pass them as arguments.
-
-    // For example, let's scan the current dir for "batch_XXXXX.tar.zst" and see if "batch_XXXXX.tar.idx.json" exists.
+    // Find .tar.zst + .tar.idx.json pairs in current directory
     DIR *d = opendir(".");
     if (!d)
     {
@@ -738,19 +662,17 @@ int main(int argc, char **argv)
     {
         if (fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0)
         {
-            // build idx filename
             char idxName[512];
             strncpy(idxName, de->d_name, sizeof(idxName));
             idxName[sizeof(idxName) - 1] = '\0';
             char *p = strstr(idxName, ".tar.zst");
             if (!p)
                 continue;
-            strcpy(p, ".tar.idx.json"); // e.g. replace .tar.zst with .tar.idx.json
+            strcpy(p, ".tar.idx.json");
 
             struct stat stbuf;
             if (stat(idxName, &stbuf) == 0)
             {
-                // we have a pair
                 if (count >= capacity)
                 {
                     size_t newcap = capacity ? capacity * 2 : 32;
@@ -774,22 +696,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Build Aho automaton
-    init_node_tracker();
-    ACNode *root = build_aho_automaton(pattern);
-    if (!root)
-    {
-        fprintf(stderr, "Cannot build AC automaton\n");
-        return 1;
-    }
-
-    // Prepare printing
+    // For printint what's been found, yay posix threads
     PrintQueue queue;
     printqueue_init(&queue);
+
     pthread_t printerTid;
     pthread_create(&printerTid, NULL, printer_thread, &queue);
-
-    // Multi-thread
     int threadCount = (count > MAX_THREADS ? MAX_THREADS : (int)count);
     pthread_t tids[threadCount];
     WorkerArg wargs[threadCount];
@@ -805,22 +717,23 @@ int main(int argc, char **argv)
         wargs[i].idxFiles = (const char **)idxFiles;
         wargs[i].start = start;
         wargs[i].end = start + load;
-        wargs[i].root = root;
-        wargs[i].searchStr = pattern;
+        wargs[i].pattern = pattern;
+        wargs[i].patLen = patLen;
         pthread_create(&tids[i], NULL, worker_thread, &wargs[i]);
         start += load;
     }
 
+    // Wait for workers to finish
     for (int i = 0; i < threadCount; i++)
     {
         pthread_join(tids[i], NULL);
     }
 
-    // Done
+    // Signal printer we're done
     printqueue_mark_done(&queue);
     pthread_join(printerTid, NULL);
 
-    // Cleanup
+    // Free free free free free
     for (size_t i = 0; i < count; i++)
     {
         free(zstFiles[i]);
@@ -830,6 +743,6 @@ int main(int argc, char **argv)
     free(idxFiles);
 
     printqueue_destroy(&queue);
-    free_aho_automaton(root);
+
     return 0;
 }
