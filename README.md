@@ -89,7 +89,7 @@ If a match is found, it will emit lines like:
 {"file":"batch_00000.tar.zst", "offset":12345, "score":7, "preview":"...some surrounding text..."}
 ```
 
-*(Note: The “score” is just a “closeness” metric used in the code. We removed any threshold so you see all matches by default.)*
+*(Note: The “score” is just a “closeness” metric used in the code. It is somewhat arbitrary.)*
 
 ## Troubleshooting
 
