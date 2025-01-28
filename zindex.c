@@ -3,5 +3,5 @@
 //
 // Want the source code? >>> Email: gonna@haras.su <<<<
 //
-// . . . - wtih love, from Prequel. :]
+// . . . - with love, from Prequel. :]
 // ---------------------------------------------------------------------
