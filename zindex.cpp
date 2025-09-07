@@ -1,23 +1,15 @@
-/******************************************************************************
- # Zindex_o3
+/*
+    zindex.cpp — tiny zstd "grep-ish" searcher over chunked .tar.zst archives.
 
-- Regex-free lazy pattern matching (NEON-accelerated BMH)
-    (still faster than ugrep when stacked with normal grep as unix pipe)
-- Bad-character shift table for maximizing skips.
-- ARM NEON SIMD intrinsics (vld1q_u8, vceqq_u8) to compare 16-byte blocks in
-parallel.
-- Assumes patterns are ≤64 bytes. Memcmp for larger.
-- The only reason this file is .cpp and not .c is because of simdjson >:(
-    ... and I'm not that mad, becuase CJSON, ugh ...
-    ... ok std::vector is convenient too sometimes ...
-- Lockless ring buffer for worker-printer thread ops. (Hated every moment of
-that.)
-- Parallel subchunk processing because. Otpimization out of spite, at this
-point.
-- Data prefetched (__builtin_prefetch) for min. cache misses
-- Way too burnt out to think abouts stacking regex on top of this abomination.
-- Bloom filter is out. I did it all wrong, I think.
- ******************************************************************************/
+    This version just fixes the C++ goto issue and uses
+    ZSTD_DCtx_reset() instead of ZSTD_resetDStream().
+    Bloom filter functionality has been removed.
+    Optimized to reuse buffers across chunks for better performance.
+
+    — preque:]
+*/
+
+#define _FILE_OFFSET_BITS 64
 
 #include <ctype.h>
 #include <dirent.h>
@@ -35,7 +27,8 @@ point.
 #include <time.h>
 #include <unistd.h>
 
-extern "C" {
+extern "C"
+{
 #include <zstd.h>
 }
 
@@ -44,6 +37,9 @@ using namespace simdjson;
 
 #if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
+#define HAVE_NEON 1
+#else
+#define HAVE_NEON 0
 #endif
 
 #ifdef __APPLE__
@@ -53,60 +49,275 @@ using namespace simdjson;
 #endif
 #endif
 
-#define MAX_THREADS 8
-#define STREAMING_WINDOW_SIZE (1024 * 1024)  
-#define COMPRESSED_BUFFER_SIZE (256 * 1024)  
-#define MAX_LINE_PREVIEW 4096
+#define MAX_THREADS 32
+#define MAX_QUEUE_SIZE 8192ULL
+#define MAX_LINE_PREVIEW 2048
 #define MAX_FILENAME_LEN 512
 #define ASCII_SET_SIZE 256
-#define MAX_PATTERN_SIZE 1024  
 
+#define ZSTD_IN_CHUNK (1u << 20) /* 1 MiB compressed feed */
+#define ZSTD_OUT_WIN (1u << 20)  /* 1 MiB decompressed window */
 
-static pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/*****************************************************************************
- * SIMD / NEON utilities
- *****************************************************************************/
-#if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
-static inline bool neon_compare_aarch64(const char *text, const char *pat,
-                                        size_t len) {
-  if (len < 64)
-    return memcmp(text, pat, len) == 0;
-
-  const uint8x16_t *t = (const uint8x16_t *)__builtin_assume_aligned(text, 16);
-  const uint8x16_t *p = (const uint8x16_t *)__builtin_assume_aligned(pat, 16);
-
-  uint64x2_t cmp_accum = vdupq_n_u64(UINT64_MAX);
-
-  for (; len >= 64; len -= 64, t += 4, p += 4) {
-    uint8x16_t t0 = vld1q_u8((const uint8_t *)t);
-    uint8x16_t t1 = vld1q_u8((const uint8_t *)(t + 1));
-    uint8x16_t t2 = vld1q_u8((const uint8_t *)(t + 2));
-    uint8x16_t t3 = vld1q_u8((const uint8_t *)(t + 3));
-
-    uint8x16_t p0 = vld1q_u8((const uint8_t *)p);
-    uint8x16_t p1 = vld1q_u8((const uint8_t *)(p + 1));
-    uint8x16_t p2 = vld1q_u8((const uint8_t *)(p + 2));
-    uint8x16_t p3 = vld1q_u8((const uint8_t *)(p + 3));
-
-    uint8x16_t c0 = vceqq_u8(t0, p0);
-    uint8x16_t c1 = vceqq_u8(t1, p1);
-    uint8x16_t c2 = vceqq_u8(t2, p2);
-    uint8x16_t c3 = vceqq_u8(t3, p3);
-
-    uint8x16_t combined = vandq_u8(vandq_u8(c0, c1), vandq_u8(c2, c3));
-    cmp_accum = vandq_u64(cmp_accum, vreinterpretq_u64_u8(combined));
-  }
-
-  return vgetq_lane_u64(cmp_accum, 0) == UINT64_MAX &&
-         vgetq_lane_u64(cmp_accum, 1) == UINT64_MAX;
+#if defined(U_ICU_VERSION_MAJOR_NUM)
+#include <unicode/utypes.h>
+#include <unicode/uchar.h>
+static inline unsigned char u_tolower_byte(unsigned char c)
+{
+  return (unsigned char)u_tolower((UChar32)c);
+}
+#else
+static inline unsigned char u_tolower_byte(unsigned char c)
+{
+  return (unsigned char)tolower((int)c);
 }
 #endif
 
-/*****************************************************************************
- * Chunk & Index Data
- *****************************************************************************/
-typedef struct {
+typedef struct
+{
+  const char *pat;
+  size_t len;
+  int bad[ASCII_SET_SIZE];
+} PatCtx;
+
+static PatCtx g_pat;
+
+static void build_badchar_table(const char *pattern, size_t patLen, int bad[ASCII_SET_SIZE])
+{
+  if (!pattern || patLen == 0)
+    return;
+  for (int i = 0; i < ASCII_SET_SIZE; i++)
+    bad[i] = (int)patLen;
+  for (size_t i = 0; i + 1 < patLen; i++)
+    bad[(unsigned char)pattern[i]] = (int)(patLen - 1 - i);
+}
+
+static inline bool bytes_equal(const char *a, const char *b, size_t len)
+{
+#if HAVE_NEON
+  while (len >= 16)
+  {
+    uint8x16_t va = vld1q_u8((const uint8_t *)a);
+    uint8x16_t vb = vld1q_u8((const uint8_t *)b);
+    uint8x16_t cmp = vceqq_u8(va, vb);
+    uint64x2_t lanes = vreinterpretq_u64_u8(cmp);
+    if ((vgetq_lane_u64(lanes, 0) != UINT64_MAX) || (vgetq_lane_u64(lanes, 1) != UINT64_MAX))
+      return false;
+    a += 16;
+    b += 16;
+    len -= 16;
+  }
+  for (size_t i = 0; i < len; ++i)
+    if ((unsigned char)a[i] != (unsigned char)b[i])
+      return false;
+  return true;
+#else
+  return memcmp(a, b, len) == 0;
+#endif
+}
+
+static inline ssize_t BMH_find(const char *hay, size_t hayLen,
+                               const char *pat, size_t patLen,
+                               const int bad[256])
+{
+  if (!hay || !pat || patLen == 0 || hayLen < patLen)
+    return -1;
+  size_t i = 0;
+  while (i <= hayLen - patLen)
+  {
+    bool match = false;
+    if (patLen <= 16)
+    {
+      match = bytes_equal(hay + i, pat, patLen);
+    }
+    else
+    {
+      if (bytes_equal(hay + i + patLen - 16, pat + patLen - 16, 16))
+      {
+        size_t j = 0;
+        while (j + 16 < patLen && hay[i + j] == pat[j])
+          ++j;
+        match = (j + 16 >= patLen);
+      }
+    }
+    if (match)
+      return (ssize_t)i;
+    unsigned char last = (unsigned char)hay[i + patLen - 1];
+    int shift = bad[last];
+    i += (shift > 0) ? shift : 1;
+  }
+  return -1;
+}
+
+typedef struct
+{
+  char filename[MAX_FILENAME_LEN];
+  char internalFilename[MAX_FILENAME_LEN];
+  int64_t offset;
+  int closenessScore;
+  char preview[MAX_LINE_PREVIEW];
+} SearchResult;
+
+typedef struct PrintNode
+{
+  SearchResult item;
+  struct PrintNode *next;
+} PrintNode;
+
+typedef struct
+{
+  PrintNode *head, *tail;
+  size_t size, max_size;
+  bool done;
+  pthread_mutex_t lock;
+  pthread_cond_t not_empty;
+  pthread_cond_t not_full;
+} PrintQueue;
+
+static void printqueue_init(PrintQueue *q)
+{
+  memset(q, 0, sizeof(*q));
+  q->max_size = MAX_QUEUE_SIZE;
+  pthread_mutex_init(&q->lock, NULL);
+  pthread_cond_init(&q->not_empty, NULL);
+  pthread_cond_init(&q->not_full, NULL);
+}
+static void printqueue_destroy(PrintQueue *q)
+{
+  pthread_mutex_lock(&q->lock);
+  for (PrintNode *cur = q->head; cur;)
+  {
+    PrintNode *n = cur->next;
+    free(cur);
+    cur = n;
+  }
+  q->head = q->tail = NULL;
+  q->size = 0;
+  pthread_mutex_unlock(&q->lock);
+  pthread_mutex_destroy(&q->lock);
+  pthread_cond_destroy(&q->not_empty);
+  pthread_cond_destroy(&q->not_full);
+}
+static bool printqueue_push(PrintQueue *q, const SearchResult *res)
+{
+  PrintNode *node = (PrintNode *)malloc(sizeof(*node));
+  if (!node)
+    return false;
+  memcpy(&node->item, res, sizeof(*res));
+  node->item.filename[sizeof(node->item.filename) - 1] = '\0';
+  node->item.preview[sizeof(node->item.preview) - 1] = '\0';
+  node->next = NULL;
+  pthread_mutex_lock(&q->lock);
+  while (q->size >= q->max_size && !q->done)
+    pthread_cond_wait(&q->not_full, &q->lock);
+  if (q->done)
+  {
+    pthread_mutex_unlock(&q->lock);
+    free(node);
+    return false;
+  }
+  if (q->tail)
+    q->tail->next = node;
+  else
+    q->head = node;
+  q->tail = node;
+  q->size++;
+  pthread_cond_signal(&q->not_empty);
+  pthread_mutex_unlock(&q->lock);
+  return true;
+}
+static bool printqueue_pop(PrintQueue *q, SearchResult *out)
+{
+  pthread_mutex_lock(&q->lock);
+  while (q->size == 0 && !q->done)
+    pthread_cond_wait(&q->not_empty, &q->lock);
+  if (q->size == 0 && q->done)
+  {
+    pthread_mutex_unlock(&q->lock);
+    return false;
+  }
+  PrintNode *node = q->head;
+  q->head = node->next;
+  if (!q->head)
+    q->tail = NULL;
+  q->size--;
+  memcpy(out, &node->item, sizeof(*out));
+  free(node);
+  pthread_cond_signal(&q->not_full);
+  pthread_mutex_unlock(&q->lock);
+  return true;
+}
+static void printqueue_mark_done(PrintQueue *q)
+{
+  pthread_mutex_lock(&q->lock);
+  q->done = true;
+  pthread_cond_broadcast(&q->not_empty);
+  pthread_cond_broadcast(&q->not_full);
+  pthread_mutex_unlock(&q->lock);
+}
+
+static void *printer_thread(void *arg)
+{
+  PrintQueue *q = (PrintQueue *)arg;
+  char line[MAX_LINE_PREVIEW + MAX_FILENAME_LEN + 128];
+  SearchResult sr;
+  setvbuf(stdout, NULL, _IOFBF, 1 << 20);
+  while (printqueue_pop(q, &sr))
+  {
+    int n = snprintf(line, sizeof(line), "%s\n", sr.preview);
+    if (n > 0)
+      (void)!write(STDOUT_FILENO, line, (size_t)n);
+  }
+  return NULL;
+}
+
+static void make_preview_and_score(const char *text, size_t textLen,
+                                   size_t matchPos, size_t /*patLen*/,
+                                   const char * /*pattern*/, SearchResult *outRes)
+{
+  if (!text || !outRes || matchPos >= textLen)
+  {
+    if (outRes)
+      outRes->preview[0] = '\0';
+    return;
+  }
+  size_t start = matchPos, end = matchPos;
+  while (start > 0 && text[start - 1] != '\n')
+    --start;
+  while (end < textLen && text[end] != '\n' && text[end] != '\0')
+    ++end;
+  size_t len = end > start ? (end - start) : 0;
+  if (len >= MAX_LINE_PREVIEW - 1)
+    len = MAX_LINE_PREVIEW - 1;
+  memcpy(outRes->preview, text + start, len);
+  outRes->preview[len] = '\0';
+  outRes->internalFilename[0] = '\0';
+  const char *exts[] = {".txt", ".csv", ".json", ".md", ".log", NULL};
+  for (int i = 0; exts[i]; ++i)
+  {
+    char *pos = strstr(outRes->preview, exts[i]);
+    if (!pos)
+      continue;
+    char *begin = pos;
+    while (begin > outRes->preview)
+    {
+      char c = *(begin - 1);
+      if (c == ' ' || c == '/' || c == '\\' || c == ':')
+        break;
+      --begin;
+    }
+    size_t fLen = (size_t)(pos - begin + strlen(exts[i]));
+    if (fLen && fLen < MAX_FILENAME_LEN)
+    {
+      strncpy(outRes->internalFilename, begin, fLen);
+      outRes->internalFilename[fLen] = '\0';
+    }
+    break;
+  }
+  outRes->closenessScore = 0;
+}
+
+typedef struct
+{
   int64_t chunk_id;
   int64_t compressed_offset;
   int64_t compressed_size;
@@ -114,486 +325,426 @@ typedef struct {
   int64_t uncompressed_end;
 } ChunkInfo;
 
-typedef struct {
+typedef struct
+{
   ChunkInfo *chunks;
   size_t count;
 } IndexInfo;
 
-/*****************************************************************************
- * Thread-local context for streaming decompression
- *****************************************************************************/
-typedef struct {
-  ZSTD_DCtx *dctx;
-  uint8_t *compressed_buf;    
-  uint8_t *window_buf;        
-  uint8_t *overlap_buf;       
-  size_t overlap_size;        
-} ThreadContext;
-
-/*****************************************************************************
- * Boyer-Moore-Horspool
- *****************************************************************************/
-static void build_badchar_table(const char *pattern, size_t patLen,
-                                int badCharTable[ASCII_SET_SIZE]) {
-  if (!pattern || patLen == 0 || !badCharTable) {
-    return;
-  }
-
-  for (int i = 0; i < ASCII_SET_SIZE; i++) {
-    badCharTable[i] = (int)patLen;
-  }
-
-  for (size_t i = 0; i < patLen - 1; i++) {
-    unsigned char c = (unsigned char)pattern[i];
-    badCharTable[c] = (int)(patLen - 1 - i);
-  }
-}
-
-/*****************************************************************************
- * Extract and print matching line
- *****************************************************************************/
-static void print_matching_line(const char *filename, const char *buffer, 
-                               size_t buf_size, size_t match_pos,
-                               int64_t base_offset) {
-  
-  size_t line_start = match_pos;
-  while (line_start > 0 && buffer[line_start - 1] != '\n') {
-    line_start--;
-  }
-  
-  
-  size_t line_end = match_pos;
-  while (line_end < buf_size && buffer[line_end] != '\n' && buffer[line_end] != '\0') {
-    line_end++;
-  }
-  
-  
-  size_t line_len = line_end - line_start;
-  if (line_len == 0) return;
-  
-  
-  pthread_mutex_lock(&print_mutex);
-  
-  
-  printf("%s:%lld:", filename, (long long)(base_offset + match_pos));
-  fwrite(buffer + line_start, 1, line_len, stdout);
-  printf("\n");
-  fflush(stdout);
-  
-  pthread_mutex_unlock(&print_mutex);
-}
-
-/*****************************************************************************
- * Streaming search with sliding window
- *****************************************************************************/
-static void streaming_search(ThreadContext *ctx, const char *filename,
-                           const char *buffer, size_t buffer_size,
-                           const char *pattern, size_t pattern_len,
-                           int64_t base_offset, int badCharTable[ASCII_SET_SIZE]) {
-  size_t i = 0;
-  
-  while (i + pattern_len <= buffer_size) {
-    
-    ssize_t j = (ssize_t)pattern_len - 1;
-    bool matched = true;
-    
-    while (j >= 0) {
-      if (buffer[i + j] != pattern[j]) {
-        matched = false;
-        break;
-      }
-      j--;
-    }
-    
-    if (matched) {
-      print_matching_line(filename, buffer, buffer_size, i, base_offset);
-      i++; 
-    } else {
-      
-      unsigned char c = (unsigned char)buffer[i + pattern_len - 1];
-      int shift = badCharTable[c];
-      if (shift < 1) shift = 1;
-      i += shift;
-    }
-  }
-}
-
-/*****************************************************************************
- * Streaming decompress and search a chunk
- *****************************************************************************/
-static void streaming_decompress_and_search(ThreadContext *ctx,
-                                          const char *zstFile,
-                                          const ChunkInfo *chunk,
-                                          const char *pattern,
-                                          size_t pattern_len) {
-  int fd = open(zstFile, O_RDONLY);
-  if (fd < 0) return;
-  
-  
-  ZSTD_DCtx_reset(ctx->dctx, ZSTD_reset_session_only);
-  
-  
-  off_t read_offset = chunk->compressed_offset;
-  size_t remaining_compressed = chunk->compressed_size;
-  int64_t uncompressed_pos = chunk->uncompressed_start;
-  
-  ZSTD_inBuffer input = {ctx->compressed_buf, 0, 0};
-  ZSTD_outBuffer output = {ctx->window_buf, STREAMING_WINDOW_SIZE, 0};
-  
-  
-  int badCharTable[ASCII_SET_SIZE];
-  build_badchar_table(pattern, pattern_len, badCharTable);
-  
-  
-  size_t search_start = 0;
-  if (ctx->overlap_size > 0) {
-    
-    memcpy(ctx->window_buf, ctx->overlap_buf, ctx->overlap_size);
-    output.pos = ctx->overlap_size;
-    search_start = 0;  
-  }
-  
-  bool first_window = true;
-  size_t last_newline_pos = 0;
-  
-  while (remaining_compressed > 0 || input.pos < input.size) {
-    
-    if (input.pos >= input.size && remaining_compressed > 0) {
-      size_t to_read = (remaining_compressed < COMPRESSED_BUFFER_SIZE) 
-                       ? remaining_compressed : COMPRESSED_BUFFER_SIZE;
-      
-      ssize_t bytes_read = pread(fd, ctx->compressed_buf, to_read, read_offset);
-      if (bytes_read <= 0) break;
-      
-      input.size = bytes_read;
-      input.pos = 0;
-      read_offset += bytes_read;
-      remaining_compressed -= bytes_read;
-    }
-    
-    
-    size_t ret = ZSTD_decompressStream(ctx->dctx, &output, &input);
-    if (ZSTD_isError(ret)) break;
-    
-    
-    if (output.pos >= STREAMING_WINDOW_SIZE - pattern_len || 
-        (remaining_compressed == 0 && input.pos >= input.size)) {
-      
-      
-      size_t search_end = output.pos;
-      
-      
-      if (!first_window && ctx->overlap_size > 0) {
-        search_start = ctx->overlap_size - pattern_len + 1;
-        if (search_start > search_end) search_start = search_end;
-      }
-      
-      
-      if (search_end > search_start) {
-        streaming_search(ctx, zstFile, 
-                        (const char*)ctx->window_buf + search_start,
-                        search_end - search_start,
-                        pattern, pattern_len,
-                        uncompressed_pos + search_start,
-                        badCharTable);
-      }
-      
-      
-      last_newline_pos = output.pos;
-      while (last_newline_pos > 0 && ctx->window_buf[last_newline_pos - 1] != '\n') {
-        last_newline_pos--;
-      }
-      
-      
-      size_t overlap_start = (last_newline_pos > 0) ? last_newline_pos : output.pos - pattern_len + 1;
-      if (overlap_start > output.pos) overlap_start = output.pos;
-      
-      ctx->overlap_size = output.pos - overlap_start;
-      if (ctx->overlap_size > 0 && ctx->overlap_size <= MAX_LINE_PREVIEW) {
-        memcpy(ctx->overlap_buf, ctx->window_buf + overlap_start, ctx->overlap_size);
-      } else {
-        ctx->overlap_size = 0;
-      }
-      
-      
-      uncompressed_pos += output.pos;
-      output.pos = 0;
-      first_window = false;
-      search_start = 0;
-    }
-  }
-  
-  
-  if (output.pos > search_start) {
-    streaming_search(ctx, zstFile,
-                    (const char*)ctx->window_buf + search_start,
-                    output.pos - search_start,
-                    pattern, pattern_len,
-                    uncompressed_pos + search_start,
-                    badCharTable);
-  }
-  
-  close(fd);
-}
-
-/*****************************************************************************
- * Parse index
- *****************************************************************************/
-static IndexInfo *parse_index_json(const char *idx_filename) {
-  if (!idx_filename) return NULL;
-
+static IndexInfo *parse_index_json(const char *idx_filename)
+{
   simdjson::dom::parser parser;
-  try {
-    simdjson::dom::element doc = parser.load(idx_filename);
-    simdjson::dom::array chunksArr = doc["chunks"];
-
+  try
+  {
+    dom::element doc = parser.load(idx_filename);
+    dom::array arr = doc["chunks"];
     size_t n = 0;
-    for (auto elem : chunksArr) {
-      n++;
-    }
-
-    if (n == 0) return NULL;
-
+    for (auto _ : arr)
+      (void)_, ++n;
+    if (!n)
+      return NULL;
     IndexInfo *info = (IndexInfo *)calloc(1, sizeof(*info));
-    if (!info) return NULL;
-
     info->count = n;
     info->chunks = (ChunkInfo *)calloc(n, sizeof(ChunkInfo));
-    if (!info->chunks) {
+    if (!info->chunks)
+    {
       free(info);
       return NULL;
     }
-
     size_t i = 0;
-    for (simdjson::dom::element chunk : chunksArr) {
-      if (i >= n) break;
-
-      ChunkInfo *C = &info->chunks[i];
-      C->chunk_id = static_cast<int64_t>(chunk["chunk_id"]);
-      C->compressed_offset = static_cast<int64_t>(chunk["compressed_offset"]);
-      C->compressed_size = static_cast<int64_t>(chunk["compressed_size"]);
-      C->uncompressed_start = static_cast<int64_t>(chunk["uncompressed_start"]);
-      C->uncompressed_end = static_cast<int64_t>(chunk["uncompressed_end"]);
-      i++;
+    for (dom::element e : arr)
+    {
+      if (i >= n)
+        break;
+      ChunkInfo *C = &info->chunks[i++];
+      C->chunk_id = (int64_t)e["chunk_id"];
+      C->compressed_offset = (int64_t)e["compressed_offset"];
+      C->compressed_size = (int64_t)e["compressed_size"];
+      C->uncompressed_start = (int64_t)e["uncompressed_start"];
+      C->uncompressed_end = (int64_t)e["uncompressed_end"];
     }
     return info;
-  } catch (const simdjson::simdjson_error &e) {
+  }
+  catch (const simdjson_error &err)
+  {
+    fprintf(stderr, "Index parse error: %s\n", err.what());
     return NULL;
   }
 }
-
-static void free_index_info(IndexInfo *info) {
-  if (!info) return;
-  if (info->chunks) free(info->chunks);
+static void free_index_info(IndexInfo *info)
+{
+  if (!info)
+    return;
+  if (info->chunks)
+    free(info->chunks);
   free(info);
 }
 
-/*****************************************************************************
- * Worker thread
- *****************************************************************************/
-typedef struct {
+static void search_in_buffer(PrintQueue *pq,
+                             const char *filename,
+                             const char *text,
+                             size_t textLen,
+                             const PatCtx *ctx,
+                             int64_t baseOff)
+{
+  if (!pq || !text || !ctx || !ctx->pat || ctx->len == 0 || textLen < ctx->len)
+    return;
+  const int *bad = ctx->bad;
+  const size_t plen = ctx->len;
+  const char *pat = ctx->pat;
+  size_t offset = 0;
+  size_t hits = 0;
+  const size_t MAX_HITS = 1000;
+  while (offset + plen <= textLen && hits < MAX_HITS)
+  {
+    ssize_t rel = BMH_find(text + offset, textLen - offset, pat, plen, bad);
+    if (rel < 0)
+      break;
+    size_t pos = offset + (size_t)rel;
+    SearchResult sr = {};
+    strncpy(sr.filename, filename, sizeof(sr.filename) - 1);
+    sr.offset = baseOff + (int64_t)pos;
+    make_preview_and_score(text, textLen, pos, plen, pat, &sr);
+    if (sr.preview[0] != '\0')
+    {
+      if (!printqueue_push(pq, &sr))
+      {
+        fprintf(stderr, "[warn] print queue saturated; dropping rest of this buffer\n");
+        break;
+      }
+      ++hits;
+    }
+    offset = pos + 1;
+  }
+}
+
+static void stream_decompress_and_search(PrintQueue *pq,
+                                         int fd,
+                                         const ChunkInfo *c,
+                                         const PatCtx *ctx,
+                                         const char *archive,
+                                         char *buf,
+                                         char *inbuf,
+                                         ZSTD_DCtx *dctx)
+{
+  const size_t OVER = (ctx->len > 1) ? (ctx->len - 1) : 0;
+
+  memset(buf, 0, OVER);
+  char *dst = buf + OVER;
+
+  int64_t absOff = c->uncompressed_start;
+  off_t file_off = (off_t)c->compressed_offset;
+  size_t remaining = (size_t)c->compressed_size;
+  bool first = true;
+
+  while (remaining > 0)
+  {
+    size_t to_read = remaining < ZSTD_IN_CHUNK ? remaining : ZSTD_IN_CHUNK;
+    ssize_t r = pread(fd, inbuf, to_read, file_off);
+    if (r <= 0)
+    {
+      fprintf(stderr, "pread failed on %s (chunk %lld): %s\n", archive, (long long)c->chunk_id, strerror(errno));
+      break;
+    }
+    file_off += (off_t)r;
+    remaining -= (size_t)r;
+
+    ZSTD_inBuffer in = {inbuf, (size_t)r, 0};
+
+    while (in.pos < in.size)
+    {
+      ZSTD_outBuffer out = {dst, ZSTD_OUT_WIN, 0};
+      size_t ret = ZSTD_decompressStream(dctx, &out, &in);
+      if (ZSTD_isError(ret))
+      {
+        fprintf(stderr, "zstd error on %s chunk %lld: %s\n", archive, (long long)c->chunk_id, ZSTD_getErrorName(ret));
+        /* Reset session if available, then continue with next input slice */
+#if defined(ZSTD_VERSION_MAJOR)
+        (void)ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
+#endif
+        break;
+      }
+
+      if (out.pos > 0)
+      {
+        char *search_ptr = first ? dst : buf;
+        size_t search_len = first ? out.pos : OVER + out.pos;
+        int64_t base = first ? absOff : absOff - (int64_t)OVER;
+
+        search_in_buffer(pq, archive, search_ptr, search_len, ctx, base);
+
+        absOff += (int64_t)out.pos;
+        first = false;
+
+        if (OVER > 0)
+        {
+          if (out.pos >= OVER)
+          {
+            memcpy(buf, dst + out.pos - OVER, OVER);
+          }
+          else
+          {
+            memmove(buf, buf + out.pos, OVER - out.pos);
+            memcpy(buf + (OVER - out.pos), dst, out.pos);
+          }
+        }
+      }
+      /* ret==0 => end of frame; loop continues if more compressed input remains */
+    }
+  }
+}
+
+static void search_indexed_file(PrintQueue *pq,
+                                const char *zstFile,
+                                const char *idxFile,
+                                const PatCtx *ctx,
+                                char *buf,
+                                char *inbuf,
+                                ZSTD_DCtx *dctx)
+{
+  IndexInfo *info = parse_index_json(idxFile);
+  if (!info)
+    return;
+
+  int fd = open(zstFile, O_RDONLY);
+  if (fd < 0)
+  {
+    fprintf(stderr, "open failed: %s\n", zstFile);
+    free_index_info(info);
+    return;
+  }
+
+  for (size_t i = 0; i < info->count; ++i)
+  {
+    const ChunkInfo *C = &info->chunks[i];
+    stream_decompress_and_search(pq, fd, C, ctx, zstFile, buf, inbuf, dctx);
+    
+    // Reset the decompression context between chunks for proper stream processing
+#if defined(ZSTD_VERSION_MAJOR)
+    ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
+#endif
+  }
+
+  close(fd);
+  free_index_info(info);
+}
+
+typedef struct
+{
   const char **zstFiles;
   const char **idxFiles;
   int fileCount;
-  int start;
-  int end;
-  const char *pattern;
-  size_t patLen;
+  int start, end;
+  PrintQueue *pqueue;
+  pthread_t tid;
   int thread_id;
 } WorkerArg;
 
-static void *worker_thread(void *arg) {
+static void *worker_thread(void *arg)
+{
   WorkerArg *W = (WorkerArg *)arg;
-  if (!W) return NULL;
-
   
-  ThreadContext ctx = {0};
-  ctx.dctx = ZSTD_createDCtx();
-  ctx.compressed_buf = (uint8_t*)malloc(COMPRESSED_BUFFER_SIZE);
-  ctx.window_buf = (uint8_t*)malloc(STREAMING_WINDOW_SIZE);
-  ctx.overlap_buf = (uint8_t*)malloc(MAX_LINE_PREVIEW);
+  // Allocate reusable buffers once per thread
+  const size_t OVER = (g_pat.len > 1) ? (g_pat.len - 1) : 0;
+  char *buf = (char *)malloc(ZSTD_OUT_WIN + OVER);
+  char *inbuf = (char *)malloc(ZSTD_IN_CHUNK);
+  ZSTD_DCtx *dctx = ZSTD_createDCtx();
   
-  if (!ctx.dctx || !ctx.compressed_buf || !ctx.window_buf || !ctx.overlap_buf) {
-    
-    if (ctx.dctx) ZSTD_freeDCtx(ctx.dctx);
-    if (ctx.compressed_buf) free(ctx.compressed_buf);
-    if (ctx.window_buf) free(ctx.window_buf);
-    if (ctx.overlap_buf) free(ctx.overlap_buf);
+  if (!buf || !inbuf || !dctx)
+  {
+    fprintf(stderr, "Thread %d: Failed to allocate buffers\n", W->thread_id);
+    if (buf) free(buf);
+    if (inbuf) free(inbuf);
+    if (dctx) ZSTD_freeDCtx(dctx);
     return NULL;
   }
-
   
-  for (int i = W->start; i < W->end && i < W->fileCount; i++) {
-    if (!W->zstFiles[i] || !W->idxFiles[i]) continue;
-
-    IndexInfo *info = parse_index_json(W->idxFiles[i]);
-    if (!info) continue;
-
-    
-    for (size_t j = 0; j < info->count; j++) {
-      ctx.overlap_size = 0;  
-      streaming_decompress_and_search(&ctx, W->zstFiles[i], 
-                                    &info->chunks[j], 
-                                    W->pattern, W->patLen);
-    }
-
-    free_index_info(info);
+  for (int i = W->start; i < W->end && i < W->fileCount; ++i)
+  {
+    if (!W->zstFiles[i] || !W->idxFiles[i])
+      continue;
+    search_indexed_file(W->pqueue, W->zstFiles[i], W->idxFiles[i], &g_pat, buf, inbuf, dctx);
   }
-
   
-  ZSTD_freeDCtx(ctx.dctx);
-  free(ctx.compressed_buf);
-  free(ctx.window_buf);
-  free(ctx.overlap_buf);
-
+  // Free buffers once at thread completion
+  ZSTD_freeDCtx(dctx);
+  free(inbuf);
+  free(buf);
+  
   return NULL;
 }
 
-/*****************************************************************************
- * Main
- *****************************************************************************/
-int main(int argc, char **argv) {
-  if (argc < 2) {
+int main(int argc, char **argv)
+{
+  if (argc < 2)
+  {
     fprintf(stderr, "Usage: %s <pattern>\n", argv[0]);
     return 1;
   }
-
   const char *pattern = argv[1];
-  size_t patLen = strlen(pattern);
-
-  if (patLen == 0 || patLen > MAX_PATTERN_SIZE) {
-    fprintf(stderr, "Error: Invalid search pattern\n");
+  const size_t patLen = strlen(pattern);
+  if (!patLen)
+  {
+    fprintf(stderr, "Empty pattern.\n");
     return 1;
   }
 
-  
+  g_pat.pat = pattern;
+  g_pat.len = patLen;
+  build_badchar_table(g_pat.pat, g_pat.len, g_pat.bad);
+
   DIR *d = opendir(".");
-  if (!d) {
-    fprintf(stderr, "Cannot open current directory: %s\n", strerror(errno));
+  if (!d)
+  {
+    fprintf(stderr, "opendir . failed: %s\n", strerror(errno));
     return 1;
   }
 
-  const size_t initialCap = 64;
-  char **zstFiles = (char **)malloc(initialCap * sizeof(*zstFiles));
-  char **idxFiles = (char **)malloc(initialCap * sizeof(*idxFiles));
-
-  if (!zstFiles || !idxFiles) {
-    if (zstFiles) free(zstFiles);
-    if (idxFiles) free(idxFiles);
+  size_t cap = 64, count = 0;
+  char **zst = (char **)malloc(cap * sizeof(*zst));
+  char **idx = (char **)malloc(cap * sizeof(*idx));
+  if (!zst || !idx)
+  {
+    fprintf(stderr, "OOM\n");
+    if (zst)
+      free(zst);
+    if (idx)
+      free(idx);
     closedir(d);
     return 1;
   }
 
-  size_t capacity = initialCap;
-  size_t count = 0;
-
   struct dirent *de;
-  while ((de = readdir(d)) != NULL) {
-    if (fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0) {
+  while ((de = readdir(d)) != NULL)
+  {
+    if (fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0)
+    {
       char idxName[MAX_FILENAME_LEN];
       strncpy(idxName, de->d_name, sizeof(idxName) - 1);
       idxName[sizeof(idxName) - 1] = '\0';
-
       char *p = strstr(idxName, ".tar.zst");
-      if (!p) continue;
-
+      if (!p)
+        continue;
       strcpy(p, ".tar.idx.json");
-
       struct stat st;
-      if (stat(idxName, &st) == 0) {
-        if (count >= capacity) {
-          capacity *= 2;
-          char **newZstFiles = (char **)realloc(zstFiles, capacity * sizeof(*zstFiles));
-          char **newIdxFiles = (char **)realloc(idxFiles, capacity * sizeof(*idxFiles));
-
-          if (!newZstFiles || !newIdxFiles) {
-            for (size_t i = 0; i < count; i++) {
-              free(zstFiles[i]);
-              free(idxFiles[i]);
+      if (stat(idxName, &st) == 0)
+      {
+        if (count >= cap)
+        {
+          cap *= 2;
+          char **nz = (char **)realloc(zst, cap * sizeof(*nz));
+          char **ni = (char **)realloc(idx, cap * sizeof(*ni));
+          if (!nz || !ni)
+          {
+            fprintf(stderr, "realloc failed\n");
+            for (size_t k = 0; k < count; k++)
+            {
+              free(zst[k]);
+              free(idx[k]);
             }
-            free(zstFiles);
-            free(idxFiles);
+            free(zst);
+            free(idx);
             closedir(d);
             return 1;
           }
-
-          zstFiles = newZstFiles;
-          idxFiles = newIdxFiles;
+          zst = nz;
+          idx = ni;
         }
-
-        zstFiles[count] = strdup(de->d_name);
-        idxFiles[count] = strdup(idxName);
-
-        if (!zstFiles[count] || !idxFiles[count]) {
-          if (zstFiles[count]) free(zstFiles[count]);
-          if (idxFiles[count]) free(idxFiles[count]);
+        zst[count] = strdup(de->d_name);
+        idx[count] = strdup(idxName);
+        if (!zst[count] || !idx[count])
+        {
+          fprintf(stderr, "strdup failed\n");
+          if (zst[count])
+            free(zst[count]);
+          if (idx[count])
+            free(idx[count]);
           break;
         }
-
-        count++;
+        ++count;
       }
     }
   }
   closedir(d);
 
-  if (count == 0) {
-    fprintf(stderr, "No chunked .tar.zst/.idx.json pairs found.\n");
-    free(zstFiles);
-    free(idxFiles);
+  if (count == 0)
+  {
+    fprintf(stderr, "No batch_*.tar.zst + .idx.json pairs found.\n");
+    free(zst);
+    free(idx);
     return 0;
   }
 
-  
-  int threadCount = (count < MAX_THREADS) ? (int)count : MAX_THREADS;
-  pthread_t *threads = (pthread_t *)malloc(threadCount * sizeof(pthread_t));
-  WorkerArg *wargs = (WorkerArg *)calloc(threadCount, sizeof(WorkerArg));
+  PrintQueue pq;
+  printqueue_init(&pq);
 
-  if (!threads || !wargs) {
-    for (size_t i = 0; i < count; i++) {
-      free(zstFiles[i]);
-      free(idxFiles[i]);
+  pthread_t printerTid;
+  if (pthread_create(&printerTid, NULL, printer_thread, &pq) != 0)
+  {
+    fprintf(stderr, "printer thread failed\n");
+    for (size_t i = 0; i < count; i++)
+    {
+      free(zst[i]);
+      free(idx[i]);
     }
-    free(zstFiles);
-    free(idxFiles);
-    if (threads) free(threads);
-    if (wargs) free(wargs);
+    free(zst);
+    free(idx);
+    printqueue_destroy(&pq);
     return 1;
   }
 
-  
-  int filesPerThread = (int)count / threadCount;
-  int remainder = (int)count % threadCount;
-  int start = 0;
+  int threads = (int)((count < MAX_THREADS) ? count : MAX_THREADS);
+  WorkerArg *args = (WorkerArg *)calloc((size_t)threads, sizeof(*args));
+  if (!args)
+  {
+    fprintf(stderr, "OOM (worker args)\n");
+    printqueue_mark_done(&pq);
+    pthread_join(printerTid, NULL);
+    for (size_t i = 0; i < count; i++)
+    {
+      free(zst[i]);
+      free(idx[i]);
+    }
+    free(zst);
+    free(idx);
+    printqueue_destroy(&pq);
+    return 1;
+  }
 
-  for (int i = 0; i < threadCount; i++) {
-    int load = filesPerThread + (i < remainder ? 1 : 0);
-    wargs[i].zstFiles = (const char **)zstFiles;
-    wargs[i].idxFiles = (const char **)idxFiles;
-    wargs[i].fileCount = (int)count;
-    wargs[i].start = start;
-    wargs[i].end = start + load;
-    wargs[i].pattern = pattern;
-    wargs[i].patLen = patLen;
-    wargs[i].thread_id = i;
-
-    pthread_create(&threads[i], NULL, worker_thread, &wargs[i]);
+  int per = (int)count / threads, rem = (int)count % threads, start = 0;
+  for (int t = 0; t < threads; ++t)
+  {
+    int load = per + (t < rem ? 1 : 0);
+    args[t].zstFiles = (const char **)zst;
+    args[t].idxFiles = (const char **)idx;
+    args[t].fileCount = (int)count;
+    args[t].start = start;
+    args[t].end = start + load;
+    args[t].pqueue = &pq;
+    args[t].thread_id = t;
     start += load;
+    if (pthread_create(&args[t].tid, NULL, worker_thread, &args[t]) != 0)
+    {
+      fprintf(stderr, "worker %d spawn failed\n", t);
+      args[t].tid = 0;
+    }
   }
 
-  
-  for (int i = 0; i < threadCount; i++) {
-    pthread_join(threads[i], NULL);
-  }
+  for (int t = 0; t < threads; ++t)
+    if (args[t].tid)
+      pthread_join(args[t].tid, NULL);
 
-  
-  for (size_t i = 0; i < count; i++) {
-    free(zstFiles[i]);
-    free(idxFiles[i]);
-  }
-  free(zstFiles);
-  free(idxFiles);
-  free(threads);
-  free(wargs);
+  printqueue_mark_done(&pq);
+  pthread_join(printerTid, NULL);
 
+  for (size_t i = 0; i < count; i++)
+  {
+    free(zst[i]);
+    free(idx[i]);
+  }
+  free(zst);
+  free(idx);
+  free(args);
+  printqueue_destroy(&pq);
   return 0;
 }
