@@ -5,8 +5,9 @@
     ZSTD_DCtx_reset() instead of ZSTD_resetDStream().
     Bloom filter functionality has been removed.
     Optimized to reuse buffers across chunks for better performance.
+    Added -d flag to specify search directory.
 
-    — preque:]
+    — Emma
 */
 
 #define _FILE_OFFSET_BITS 64
@@ -26,6 +27,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 
 extern "C"
 {
@@ -574,14 +576,60 @@ static void *worker_thread(void *arg)
   return NULL;
 }
 
+// Helper function to build full path
+static char* build_path(const char *dir, const char *file)
+{
+  size_t dir_len = strlen(dir);
+  size_t file_len = strlen(file);
+  bool need_slash = (dir_len > 0 && dir[dir_len - 1] != '/');
+  
+  size_t total_len = dir_len + (need_slash ? 1 : 0) + file_len + 1;
+  char *path = (char *)malloc(total_len);
+  if (!path)
+    return NULL;
+  
+  strcpy(path, dir);
+  if (need_slash)
+    strcat(path, "/");
+  strcat(path, file);
+  
+  return path;
+}
+
 int main(int argc, char **argv)
 {
-  if (argc < 2)
+  const char *search_dir = ".";
+  const char *pattern = NULL;
+  
+  // Parse command line arguments
+  int opt;
+  while ((opt = getopt(argc, argv, "d:h")) != -1)
   {
-    fprintf(stderr, "Usage: %s <pattern>\n", argv[0]);
+    switch (opt)
+    {
+    case 'd':
+      search_dir = optarg;
+      break;
+    case 'h':
+      fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
+      fprintf(stderr, "  -d directory  Directory to search (default: current directory)\n");
+      fprintf(stderr, "  -h           Show this help message\n");
+      return 0;
+    default:
+      fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
+      return 1;
+    }
+  }
+  
+  // Get the pattern from remaining arguments
+  if (optind >= argc)
+  {
+    fprintf(stderr, "Error: No search pattern specified\n");
+    fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
     return 1;
   }
-  const char *pattern = argv[1];
+  pattern = argv[optind];
+  
   const size_t patLen = strlen(pattern);
   if (!patLen)
   {
@@ -589,14 +637,27 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  // Check if directory exists
+  struct stat dir_stat;
+  if (stat(search_dir, &dir_stat) != 0)
+  {
+    fprintf(stderr, "Error: Cannot access directory '%s': %s\n", search_dir, strerror(errno));
+    return 1;
+  }
+  if (!S_ISDIR(dir_stat.st_mode))
+  {
+    fprintf(stderr, "Error: '%s' is not a directory\n", search_dir);
+    return 1;
+  }
+
   g_pat.pat = pattern;
   g_pat.len = patLen;
   build_badchar_table(g_pat.pat, g_pat.len, g_pat.bad);
 
-  DIR *d = opendir(".");
+  DIR *d = opendir(search_dir);
   if (!d)
   {
-    fprintf(stderr, "opendir . failed: %s\n", strerror(errno));
+    fprintf(stderr, "opendir %s failed: %s\n", search_dir, strerror(errno));
     return 1;
   }
 
@@ -619,15 +680,37 @@ int main(int argc, char **argv)
   {
     if (fnmatch("batch_[0-9][0-9][0-9][0-9][0-9].tar.zst", de->d_name, 0) == 0)
     {
+      // Build full paths for the .zst and .idx.json files
+      char *zstPath = build_path(search_dir, de->d_name);
+      if (!zstPath)
+      {
+        fprintf(stderr, "Failed to build path for %s\n", de->d_name);
+        continue;
+      }
+      
+      // Build the index filename
       char idxName[MAX_FILENAME_LEN];
       strncpy(idxName, de->d_name, sizeof(idxName) - 1);
       idxName[sizeof(idxName) - 1] = '\0';
       char *p = strstr(idxName, ".tar.zst");
       if (!p)
+      {
+        free(zstPath);
         continue;
+      }
       strcpy(p, ".tar.idx.json");
+      
+      char *idxPath = build_path(search_dir, idxName);
+      if (!idxPath)
+      {
+        fprintf(stderr, "Failed to build path for %s\n", idxName);
+        free(zstPath);
+        continue;
+      }
+      
+      // Check if index file exists
       struct stat st;
-      if (stat(idxName, &st) == 0)
+      if (stat(idxPath, &st) == 0)
       {
         if (count >= cap)
         {
@@ -637,6 +720,8 @@ int main(int argc, char **argv)
           if (!nz || !ni)
           {
             fprintf(stderr, "realloc failed\n");
+            free(zstPath);
+            free(idxPath);
             for (size_t k = 0; k < count; k++)
             {
               free(zst[k]);
@@ -650,18 +735,14 @@ int main(int argc, char **argv)
           zst = nz;
           idx = ni;
         }
-        zst[count] = strdup(de->d_name);
-        idx[count] = strdup(idxName);
-        if (!zst[count] || !idx[count])
-        {
-          fprintf(stderr, "strdup failed\n");
-          if (zst[count])
-            free(zst[count]);
-          if (idx[count])
-            free(idx[count]);
-          break;
-        }
+        zst[count] = zstPath;
+        idx[count] = idxPath;
         ++count;
+      }
+      else
+      {
+        free(zstPath);
+        free(idxPath);
       }
     }
   }
@@ -669,7 +750,7 @@ int main(int argc, char **argv)
 
   if (count == 0)
   {
-    fprintf(stderr, "No batch_*.tar.zst + .idx.json pairs found.\n");
+    fprintf(stderr, "No batch_*.tar.zst + .idx.json pairs found in directory: %s\n", search_dir);
     free(zst);
     free(idx);
     return 0;
